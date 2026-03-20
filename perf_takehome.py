@@ -268,12 +268,10 @@ class KernelBuilder:
 
         inp_values_p = self.alloc_scratch("inp_values_p")
         forest_values_p = self.alloc_scratch("forest_values_p")
-        batch_size_reg = self.alloc_scratch("batch_size_reg")
 
         pointer_offsets = {
             "forest_values": self.scratch_const(4),
             "inp_values": self.scratch_const(6),
-            "batch_size": self.scratch_const(2),
         }
 
         # === PHASE 2: Allocate runtime constants ===
@@ -308,26 +306,32 @@ class KernelBuilder:
         batch_base_ptr = self.alloc_scratch("batch_base_ptr")
         tasks = [(r, block_start) for r in range(rounds) for block_start in self.BLOCK_STARTS]
         n_batches = batch_size // (self.UNROLL * VLEN)
-        batch_step = self.UNROLL * VLEN
-        batch_offset_consts = {
-            batch_i: self.scratch_const(batch_i * batch_step)
-            for batch_i in range(1, n_batches)
-        }
 
-        self.flush_const_loads()
+        while len(self.pending_const_loads) > 1:
+            slots = [
+                ("const", addr, val)
+                for addr, val in self.pending_const_loads[: SLOT_LIMITS["load"]]
+            ]
+            self.emit({"load": slots})
+            del self.pending_const_loads[: SLOT_LIMITS["load"]]
 
-        self.emit({"load": [
-            ("load", forest_values_p, pointer_offsets["forest_values"]),
-        ]})
-        self.emit({"load": [
-            ("load", inp_values_p, pointer_offsets["inp_values"]),
-            ("load", batch_size_reg, pointer_offsets["batch_size"]),
-        ]})
-        self.emit({"valu": [
-            ("vbroadcast", v_forest_p, forest_values_p),
-        ]})
-        for i in range(0, len(hash_broadcasts), SLOT_LIMITS["valu"]):
-            self.emit({"valu": hash_broadcasts[i : i + SLOT_LIMITS["valu"]]})
+        final_const_slots = [
+            ("const", addr, val) for addr, val in self.pending_const_loads
+        ]
+        self.pending_const_loads.clear()
+        final_const_slots.append(("load", forest_values_p, pointer_offsets["forest_values"]))
+        self.emit(
+            {
+                "load": final_const_slots,
+                "valu": hash_broadcasts[: SLOT_LIMITS["valu"]],
+            }
+        )
+        self.emit(
+            {
+                "load": [("load", inp_values_p, pointer_offsets["inp_values"])],
+                "valu": hash_broadcasts[SLOT_LIMITS["valu"] :],
+            }
+        )
 
         pending_store_chunks = None
         for batch_i in range(n_batches):
@@ -335,7 +339,8 @@ class KernelBuilder:
             base_source = inp_values_p
             overlapped_store_i = 0
             if batch_i != 0:
-                instr = {"alu": [("+", batch_base_ptr, inp_values_p, batch_offset_consts[batch_i])]}
+                prev_batch_base_val = batch_base_vals[(batch_i - 1) % 2]
+                instr = {"alu": [("+", batch_base_ptr, prev_batch_base_val[-1], offset_consts[1])]}
                 if pending_store_chunks is not None:
                     instr["store"] = pending_store_chunks[0]
                     overlapped_store_i = 1
@@ -351,9 +356,11 @@ class KernelBuilder:
             seed_addr_ops = [("+", v_addr[u], v_forest_p, v_idx[u]) for u in range(self.UNROLL)]
             base_chunks = [base_ops[:12], base_ops[12:]]
             valu_chunks = [
-                zero_idx_ops[:6],
-                zero_idx_ops[6:12],
-                zero_idx_ops[12:],
+                ([("vbroadcast", v_forest_p, forest_values_p)] + zero_idx_ops[:5])
+                if batch_i == 0
+                else zero_idx_ops[:6],
+                zero_idx_ops[5:11] if batch_i == 0 else zero_idx_ops[6:12],
+                zero_idx_ops[11:] if batch_i == 0 else zero_idx_ops[12:],
                 seed_addr_ops[:6],
                 seed_addr_ops[6:12],
                 seed_addr_ops[12:],
